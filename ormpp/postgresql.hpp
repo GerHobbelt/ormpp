@@ -525,23 +525,30 @@ class postgresql {
                                        Args &&...args) {
     std::vector<std::vector<char>> param_values;
     constexpr auto arr = iguana::indexs_of<members...>();
-    iguana::for_each(t,
-                     [&t, arr, &param_values, type, this](auto item, auto i) {
-                       if (type == OptType::insert &&
-                           is_auto_key<T>(iguana::get_name<T>(i).data())) {
-                         return;
-                       }
-                       if constexpr (sizeof...(members) > 0) {
-                         for (auto idx : arr) {
-                           if (idx == decltype(i)::value) {
-                             set_param_values(param_values, t.*item);
+    if constexpr (sizeof...(members) > 0) {
+      (set_param_values(param_values,
+                        iguana::get<iguana::index_of<members>()>(t)),
+       ...);
+    }
+    else {
+      iguana::for_each(t,
+                       [&t, arr, &param_values, type, this](auto item, auto i) {
+                         if (type == OptType::insert &&
+                             is_auto_key<T>(iguana::get_name<T>(i).data())) {
+                           return;
+                         }
+                         if constexpr (sizeof...(members) > 0) {
+                           for (auto idx : arr) {
+                             if (idx == decltype(i)::value) {
+                               set_param_values(param_values, t.*item);
+                             }
                            }
                          }
-                       }
-                       else {
-                         set_param_values(param_values, t.*item);
-                       }
-                     });
+                         else {
+                           set_param_values(param_values, t.*item);
+                         }
+                       });
+    }
 
     if constexpr (sizeof...(Args) == 0) {
       if (type == OptType::update) {
@@ -701,17 +708,31 @@ class postgresql {
       sprintf(temp.data(), "%f", value);
       param_values.push_back(std::move(temp));
     }
-    else if constexpr (std::is_same_v<std::string, U>) {
+    else if constexpr (iguana::array_v<U> || std::is_same_v<std::string, U>) {
       std::vector<char> temp = {};
       std::copy(value.data(), value.data() + value.size() + 1,
                 std::back_inserter(temp));
       param_values.push_back(std::move(temp));
     }
-    else if constexpr (is_char_array_v<U>) {
+    else if constexpr (iguana::c_array_v<U>) {
       std::vector<char> temp = {};
       std::copy(value, value + sizeof(U), std::back_inserter(temp));
       param_values.push_back(std::move(temp));
     }
+    else if constexpr (std::is_same_v<blob, U>) {
+      std::vector<char> temp = {};
+      std::copy(value.data(), value.data() + value.size(),
+                std::back_inserter(temp));
+      param_values.push_back(std::move(temp));
+    }
+#ifdef ORMPP_WITH_CSTRING
+    else if constexpr (std::is_same_v<CString, U>) {
+      std::vector<char> temp = {};
+      std::copy(value.GetString(), value.GetString() + value.GetLength() + 1,
+                std::back_inserter(temp));
+      param_values.push_back(std::move(temp));
+    }
+#endif
     else {
       static_assert(!sizeof(U), "this type has not supported yet");
     }
@@ -745,10 +766,23 @@ class postgresql {
     else if constexpr (std::is_same_v<std::string, U>) {
       value = PQgetvalue(res_, row, i);
     }
-    else if constexpr (is_char_array_v<U>) {
+    else if constexpr (iguana::array_v<U>) {
+      auto p = PQgetvalue(res_, row, i);
+      memcpy(value.data(), p, value.size());
+    }
+    else if constexpr (iguana::c_array_v<U>) {
       auto p = PQgetvalue(res_, row, i);
       memcpy(value, p, sizeof(U));
     }
+    else if constexpr (std::is_same_v<blob, U>) {
+      auto p = PQgetvalue(res_, row, i);
+      value = blob(p, p + PQgetlength(res_, row, i));
+    }
+#ifdef ORMPP_WITH_CSTRING
+    else if constexpr (std::is_same_v<CString, U>) {
+      value.SetString(PQgetvalue(res_, row, i));
+    }
+#endif
     else {
       static_assert(!sizeof(U), "this type has not supported yet");
     }

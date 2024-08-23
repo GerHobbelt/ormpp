@@ -490,27 +490,25 @@ class sqlite {
 
   template <auto... members, typename T, typename... Args>
   int stmt_execute(const T &t, OptType type, Args &&...args) {
-    int index = 1;
+    size_t index = 0;
     bool bind_ok = true;
-    constexpr auto arr = iguana::indexs_of<members...>();
-    iguana::for_each(
-        t, [&t, arr, &bind_ok, &index, type, this](auto item, auto i) {
-          if ((type == OptType::insert &&
-               is_auto_key<T>(iguana::get_name<T>(i).data())) ||
-              !bind_ok) {
-            return;
-          }
-          if constexpr (sizeof...(members) > 0) {
-            for (auto idx : arr) {
-              if (idx == decltype(i)::value) {
-                bind_ok = set_param_bind(t.*item, index++);
-              }
-            }
-          }
-          else {
-            bind_ok = set_param_bind(t.*item, index++);
-          }
-        });
+    if constexpr (sizeof...(members) > 0) {
+      ((bind_ok && (bind_ok = set_param_bind(
+                        iguana::get<iguana::index_of<members>()>(t), ++index)),
+        true),
+       ...);
+    }
+    else {
+      iguana::for_each(t,
+                       [&t, &bind_ok, &index, type, this](auto item, auto i) {
+                         if ((type == OptType::insert &&
+                              is_auto_key<T>(iguana::get_name<T>(i).data())) ||
+                             !bind_ok) {
+                           return;
+                         }
+                         bind_ok = set_param_bind(t.*item, ++index);
+                       });
+    }
 
     if constexpr (sizeof...(Args) == 0) {
       if (type == OptType::update) {
@@ -519,7 +517,7 @@ class sqlite {
             return;
           }
           if (is_conflict_key<T>(iguana::get_name<T>(i).data())) {
-            bind_ok = set_param_bind(t.*item, index++);
+            bind_ok = set_param_bind(t.*item, ++index);
           }
         });
       }
@@ -537,7 +535,7 @@ class sqlite {
 
     int count = sqlite3_changes(handle_);
     if (count == 0) {
-      return INT_MIN;
+      return type == OptType::update ? count : INT_MIN;
     }
 
     return 1;
@@ -564,23 +562,26 @@ class sqlite {
     else if constexpr (std::is_floating_point_v<U>) {
       return SQLITE_OK == sqlite3_bind_double(stmt_, i, value);
     }
-    else if constexpr (std::is_same_v<std::string, U>) {
+    else if constexpr (iguana::array_v<U> || std::is_same_v<std::string, U>) {
       return SQLITE_OK ==
              sqlite3_bind_text(stmt_, i, value.data(), value.size(), nullptr);
     }
-    else if constexpr (std::is_same_v<char,
+    else if constexpr (iguana::c_array_v<U> ||
+                       std::is_same_v<char,
                                       std::remove_pointer_t<std::decay_t<U>>>) {
       return SQLITE_OK ==
              sqlite3_bind_text(stmt_, i, value, strlen(value), nullptr);
     }
-    else if constexpr (is_char_array_v<U>) {
-      return SQLITE_OK ==
-             sqlite3_bind_text(stmt_, i, value, sizeof(U), nullptr);
+    else if constexpr (std::is_same_v<blob, U>) {
+      return SQLITE_OK == sqlite3_bind_blob(stmt_, i, value.data(),
+                                            static_cast<size_t>(value.size()),
+                                            nullptr);
     }
 #ifdef ORMPP_WITH_CSTRING
     else if constexpr (std::is_same_v<CString, U>) {
-      return SQLITE_OK == sqlite3_bind_text(stmt_, i, value.GetString(),
-                                            (int)value.GetLength(), nullptr);
+      return SQLITE_OK ==
+             sqlite3_bind_text(stmt_, i, value.GetString(),
+                               static_cast<size_t>(value.GetLength()), nullptr);
     }
 #endif
     else {
@@ -623,8 +624,15 @@ class sqlite {
       value.assign((const char *)sqlite3_column_text(stmt_, i),
                    (size_t)sqlite3_column_bytes(stmt_, i));
     }
-    else if constexpr (is_char_array_v<U>) {
+    else if constexpr (iguana::array_v<U>) {
+      memcpy(value.data(), sqlite3_column_text(stmt_, i), sizeof(U));
+    }
+    else if constexpr (iguana::c_array_v<U>) {
       memcpy(value, sqlite3_column_text(stmt_, i), sizeof(U));
+    }
+    else if constexpr (std::is_same_v<blob, U>) {
+      auto p = (const char *)sqlite3_column_blob(stmt_, i);
+      value = blob(p, p + sqlite3_column_bytes(stmt_, i));
     }
 #ifdef ORMPP_WITH_CSTRING
     else if constexpr (std::is_same_v<CString, U>) {

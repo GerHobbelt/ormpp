@@ -16,8 +16,6 @@
 
 namespace ormpp {
 
-using blob = ormpp_mysql::blob;
-
 class mysql {
  public:
   ~mysql() { disconnect(); }
@@ -177,7 +175,13 @@ class mysql {
       param.buffer = (void *)(value.c_str());
       param.buffer_length = (unsigned long)value.size();
     }
-    else if constexpr (std::is_same_v<const char *, U> || is_char_array_v<U>) {
+    else if constexpr (iguana::array_v<U>) {
+      param.buffer_type = MYSQL_TYPE_STRING;
+      param.buffer = (void *)(value.data());
+      param.buffer_length = (unsigned long)value.size();
+    }
+    else if constexpr (iguana::c_array_v<U> ||
+                       std::is_same_v<const char *, U>) {
       param.buffer_type = MYSQL_TYPE_STRING;
       param.buffer = (void *)(value);
       param.buffer_length = (unsigned long)strlen(value);
@@ -187,6 +191,13 @@ class mysql {
       param.buffer = (void *)(value.data());
       param.buffer_length = (unsigned long)value.size();
     }
+#ifdef ORMPP_WITH_CSTRING
+    else if constexpr (std::is_same_v<CString, U>) {
+      param.buffer_type = MYSQL_TYPE_STRING;
+      param.buffer = (void *)(value.GetString());
+      param.buffer_length = (unsigned long)value.GetLength();
+    }
+#endif
     else {
       static_assert(!sizeof(U), "this type has not supported yet");
     }
@@ -221,7 +232,7 @@ class mysql {
       param_bind.buffer = &(mp.rbegin()->second[0]);
       param_bind.buffer_length = 65536;
     }
-    else if constexpr (is_char_array_v<U>) {
+    else if constexpr (iguana::array_v<U>) {
       param_bind.buffer_type = MYSQL_TYPE_VAR_STRING;
       std::vector<char> tmp(sizeof(U), 0);
       mp.emplace(i, std::move(tmp));
@@ -235,6 +246,15 @@ class mysql {
       param_bind.buffer = &(mp.rbegin()->second[0]);
       param_bind.buffer_length = 65536;
     }
+#ifdef ORMPP_WITH_CSTRING
+    else if constexpr (std::is_same_v<CString, U>) {
+      param_bind.buffer_type = MYSQL_TYPE_STRING;
+      std::vector<char> tmp(65536, 0);
+      mp.emplace(i, std::move(tmp));
+      param_bind.buffer = &(mp.rbegin()->second[0]);
+      param_bind.buffer_length = 65536;
+    }
+#endif
     else {
       static_assert(!sizeof(U), "this type has not supported yet");
     }
@@ -262,14 +282,20 @@ class mysql {
       auto &vec = mp[i];
       value = std::string(&vec[0], strlen(vec.data()));
     }
-    else if constexpr (is_char_array_v<U>) {
+    else if constexpr (iguana::array_v<U>) {
       auto &vec = mp[i];
-      memcpy(value, vec.data(), vec.size());
+      memcpy(value.data(), vec.data(), value.size());
     }
     else if constexpr (std::is_same_v<blob, U>) {
       auto &vec = mp[i];
       value = blob(vec.data(), vec.data() + get_blob_len(i));
     }
+#ifdef ORMPP_WITH_CSTRING
+    else if constexpr (std::is_same_v<CString, U>) {
+      auto &vec = mp[i];
+      value.SetString(std::string(&vec[0], strlen(vec.data()).c_str()));
+    }
+#endif
   }
 
   template <typename T, typename... Args>
@@ -917,22 +943,29 @@ class mysql {
   int stmt_execute(const T &t, OptType type, Args &&...args) {
     std::vector<MYSQL_BIND> param_binds;
     constexpr auto arr = iguana::indexs_of<members...>();
-    iguana::for_each(t, [&t, arr, &param_binds, type, this](auto item, auto i) {
-      if (type == OptType::insert &&
-          is_auto_key<T>(iguana::get_name<T>(i).data())) {
-        return;
-      }
-      if constexpr (sizeof...(members) > 0) {
-        for (auto idx : arr) {
-          if (idx == decltype(i)::value) {
-            set_param_bind(param_binds, t.*item);
-          }
-        }
-      }
-      else {
-        set_param_bind(param_binds, t.*item);
-      }
-    });
+    if constexpr (sizeof...(members) > 0) {
+      (set_param_bind(param_binds, iguana::get<iguana::index_of<members>()>(t)),
+       ...);
+    }
+    else {
+      iguana::for_each(t,
+                       [&t, arr, &param_binds, type, this](auto item, auto i) {
+                         if (type == OptType::insert &&
+                             is_auto_key<T>(iguana::get_name<T>(i).data())) {
+                           return;
+                         }
+                         if constexpr (sizeof...(members) > 0) {
+                           for (auto idx : arr) {
+                             if (idx == decltype(i)::value) {
+                               set_param_bind(param_binds, t.*item);
+                             }
+                           }
+                         }
+                         else {
+                           set_param_bind(param_binds, t.*item);
+                         }
+                       });
+    }
 
     if constexpr (sizeof...(Args) == 0) {
       if (type == OptType::update) {
@@ -959,7 +992,7 @@ class mysql {
 
     int count = (int)mysql_stmt_affected_rows(stmt_);
     if (count == 0) {
-      return INT_MIN;
+      return type == OptType::update ? count : INT_MIN;
     }
 
     return count;

@@ -7,6 +7,7 @@
 
 #include "entity.hpp"
 #include "iguana/reflection.hpp"
+#include "iguana/util.hpp"
 #include "type_mapping.hpp"
 
 namespace ormpp {
@@ -149,6 +150,11 @@ inline constexpr auto get_type_names(DBType type) {
       else if constexpr (is_optional_v<U>::value) {
         s = ormpp_mysql::type_to_name(identity<typename U::value_type>{});
       }
+#ifdef ORMPP_WITH_CSTRING
+      else if constexpr (std::is_same_v<CString, U>) {
+        s = "TEXT"sv;
+      }
+#endif
       else {
         s = ormpp_mysql::type_to_name(identity<U>{});
       }
@@ -180,6 +186,11 @@ inline constexpr auto get_type_names(DBType type) {
       else if constexpr (is_optional_v<U>::value) {
         s = ormpp_postgresql::type_to_name(identity<typename U::value_type>{});
       }
+#ifdef ORMPP_WITH_CSTRING
+      else if constexpr (std::is_same_v<CString, U>) {
+        s = "TEXT"sv;
+      }
+#endif
       else {
         s = ormpp_postgresql::type_to_name(identity<U>{});
       }
@@ -201,7 +212,7 @@ inline void for_each0(const std::tuple<Args...> &t, Func &&f,
 template <typename T, typename = std::enable_if_t<iguana::is_reflection_v<T>>>
 inline std::string get_name() {
 #ifdef ORMPP_ENABLE_PG
-  std::string quota_name = std::string(iguana::get_name<T>());
+  std::string quota_name = "\"" + std::string(iguana::get_name<T>()) + "\"";
 #else
   std::string quota_name = "`" + std::string(iguana::get_name<T>()) + "`";
 #endif
@@ -335,11 +346,9 @@ inline std::string generate_insert_sql(bool insert, Args &&...args) {
     }
   }
   if (fields.back() != ')') {
-    fields.pop_back();
     fields.back() = ')';
   }
   if (values.back() != ')') {
-    values.pop_back();
     values.back() = ')';
   }
   append(sql, fields, values);
@@ -403,15 +412,6 @@ inline std::string generate_update_sql(Args &&...args) {
 }
 
 inline bool is_empty(const std::string &t) { return t.empty(); }
-
-template <class T>
-constexpr bool is_char_array_v = std::is_array_v<T>
-    &&std::is_same_v<char, std::remove_pointer_t<std::decay_t<T>>>;
-
-template <size_t N>
-inline constexpr size_t char_array_size(char (&)[N]) {
-  return N;
-}
 
 template <typename T, typename... Args>
 inline std::string generate_delete_sql(Args &&...where_conditon) {
