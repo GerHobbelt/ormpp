@@ -43,6 +43,12 @@ struct col_info {
     return *this;
   }
 
+  where_condition param() {
+    std::string str(class_name);
+    str.append(".").append(name);
+    return where_condition{str, " = ", "?  "};
+  }
+
   template <typename... Args>
   where_condition in(Args... args) {
     return in_impl("", args...);
@@ -130,14 +136,33 @@ where_condition operator&&(where_condition lhs, where_condition rhs) {
   return where_condition{lhs.to_sql(), " AND ", rhs.to_sql()};
 }
 
-template <typename M, typename value_type>
-where_condition build_where(col_info<M> field, value_type val, std::string op) {
-  static_assert(std::is_constructible_v<M, value_type>, "invalid type");
-  if constexpr (std::is_arithmetic_v<value_type>) {
-    return where_condition{std::string(field.name), op, std::to_string(val)};
+where_condition build_where(auto field, auto val, std::string op) {
+  using M = typename decltype(field)::value_type;
+  using value_type = decltype(val);
+  if constexpr (iguana::array_v<M>) {
+    static_assert(
+        std::is_same_v<typename M::value_type, typename value_type::value_type>,
+        "invalid type");
   }
   else {
-    return where_condition{std::string(field.name), op, val, true};
+    static_assert(std::is_constructible_v<M, value_type>, "invalid type");
+  }
+  std::string name(field.class_name);
+  if (name.empty()) {
+    name.append(field.name);
+  }
+  else {
+    name.append(".").append(field.name);
+  }
+
+  if constexpr (std::is_arithmetic_v<value_type>) {
+    return where_condition{name, op, std::to_string(val)};
+  }
+  else {
+    if (val == "?  ") {
+      return where_condition{name, op, val};
+    }
+    return where_condition{name, op, val, true};
   }
 }
 
@@ -171,6 +196,112 @@ auto operator<(col_info<M> field, M val) {
   return build_where(field, val, "<");
 }
 
+template <typename Arg>
+struct aggregate_field {
+  using value_type = Arg;
+  std::string name;
+  std::string_view class_name;
+};
+
+template <typename M>
+auto operator==(aggregate_field<M> field, auto val) {
+  return build_where(field, val, "=");
+}
+
+template <typename M>
+auto operator!=(aggregate_field<M> field, auto val) {
+  return build_where(field, val, "!=");
+}
+
+template <typename M>
+auto operator>(aggregate_field<M> field, auto val) {
+  return build_where(field, val, ">");
+}
+
+template <typename M>
+auto operator>=(aggregate_field<M> field, auto val) {
+  return build_where(field, val, ">=");
+}
+
+template <typename M>
+auto operator<(aggregate_field<M> field, auto val) {
+  return build_where(field, val, "<");
+}
+
+template <typename M>
+auto operator<=(aggregate_field<M> field, auto val) {
+  return build_where(field, val, "<=");
+}
+
+struct token_t {};
+inline constexpr auto token = token_t{};
+
+inline auto count() { return aggregate_field<uint64_t>{"COUNT(*)"}; }
+
+template <typename T>
+inline auto build_aggregate_field(std::string prefix, auto field) {
+  std::string str = std::move(prefix);
+  str.append(field.class_name).append(".").append(field.name).append(")");
+  return aggregate_field<T>{str};
+}
+
+inline auto count(auto field) {
+  return build_aggregate_field<uint64_t>("COUNT(", field);
+}
+
+inline auto count_distinct(auto field) {
+  return build_aggregate_field<uint64_t>("COUNT(DISTINCT ", field);
+}
+
+inline auto sum(auto field) {
+  return build_aggregate_field<uint64_t>("SUM(", field);
+}
+
+inline auto avg(auto field) {
+  return build_aggregate_field<double>("AVG(", field);
+}
+
+template <typename Field>
+inline auto(min)(Field field) {
+  return build_aggregate_field<typename Field::value_type>("MIN(", field);
+}
+
+template <typename Field>
+inline auto(max)(Field field) {
+  return build_aggregate_field<typename Field::value_type>("MAX(", field);
+}
+
+template <typename T>
+inline std::string join_impl(std::string prefix, auto field1, auto field2) {
+  std::string sql;
+  sql.append(prefix).append("join ");
+  if (ylt::reflection::get_struct_name<T>() == field1.class_name) {
+    sql.append(field2.class_name);
+  }
+  else {
+    sql.append(field1.class_name);
+  }
+
+  sql.append(" ON ")
+      .append(field1.class_name)
+      .append(".")
+      .append(field1.name)
+      .append("=")
+      .append(field2.class_name)
+      .append(".")
+      .append(field2.name)
+      .append(" ");
+  return sql;
+}
+
+template <typename... Args>
+std::string order_by_sql(Args... fields) {
+  std::string sql = " ORDER BY ";
+  (sql.append(fields.name).append(fields.sort_order).append(","), ...);
+  sql.pop_back();
+  return sql;
+}
+
 template <typename DB, typename R>
 struct stage_select;
 
@@ -184,8 +315,11 @@ class query_builder {
     std::string sql_;
     std::string select_clause_;
     std::string from_clause_;
+    std::string group_by_clause_;
+    std::string join_clause_;
     std::string where_clause_;
     std::string order_by_clause_;
+    std::string having_clause_;
     std::string desc_clause_;
     std::string limit_clause_;
     std::string offset_clause_;
@@ -218,27 +352,47 @@ class query_builder {
       return "";
     }
 
-    auto collect() {
+    template <typename... Args>
+    auto scalar(Args... args) {
+      using first = std::tuple_element_t<0, R>;
+      return collect<first>(args...);
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
       if (!select_clause_.empty()) {
         sql_.append("select ").append(select_clause_).append(from_clause_);
         if (!where_clause_.empty()) {
-          sql_.append(" where ");
+          where_clause_.insert(0, " where ");
         }
       }
 
-      sql_.append(where_clause_)
+      sql_.append(join_clause_)
+          .append(where_clause_)
+          .append(group_by_clause_)
+          .append(having_clause_)
           .append(order_by_clause_)
           .append(desc_clause_)
           .append(limit_clause_)
           .append(offset_clause_);
 
-      if constexpr (std::is_integral_v<R>) {
-        std::string sql = "select ";
-        sql.append(aggregate_clause())
-            .append(" from ")
-            .append(ylt::reflection::get_struct_name<T>())
-            .append(";");
-        auto t = db_->template query_s<std::tuple<R>>(sql);
+#ifdef ORMPP_ENABLE_PG
+      if (sql_.find('?') != std::string::npos) {
+        int index = 1;
+        for (size_t i = 0; i < sql_.size(); i++) {
+          if (sql_[i] == '?') {
+            sql_[i] = '$';
+            std::string index_str = std::to_string(index++);
+            std::memcpy(&sql_[i + 1], index_str.data(),
+                        (std::min)(index_str.size(), size_t(2)));
+          }
+        }
+      }
+#endif
+
+      if constexpr (!ylt::reflection::is_ylt_refl_v<R> && !std::is_void_v<R> &&
+                    !iguana::tuple_v<R>) {
+        auto t = db_->template query_s<std::tuple<R>>(sql_, args...);
         if (t.empty()) {
           return R{};
         }
@@ -246,13 +400,35 @@ class query_builder {
       }
       else {
         if constexpr (std::is_void_v<R>) {
-          return db_->template query_s<T>(sql_);
+          return db_->template query_s<T>(sql_, args...);
         }
         else {
-          auto t = db_->template query_s<R>(sql_);
-          return t;
+          if constexpr (std::is_void_v<To>) {
+            auto t = db_->template query_s<R>(sql_, args...);
+            return t;
+          }
+          else {
+            // To: maybe a tuple mapping struct or a first row first col type.
+            if constexpr (iguana::optional_v<To> || std::is_arithmetic_v<To> ||
+                          iguana::string_container_v<To>) {
+              auto t = db_->template query_s<R>(sql_, args...);
+              if (t.empty()) {
+                return To{};
+              }
+              return std::get<0>(t.front());
+            }
+            else {
+              auto t = db_->template query_s<To>(sql_, args...);
+              return t;
+            }
+          }
         }
       }
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return collect<void>(args...);
     }
   };
 
@@ -261,17 +437,38 @@ class query_builder {
     ctx_->db_ = db;
   }
 
-  template <typename U = T>
-  auto collect() {
-    return ctx_->template collect();
+  template <typename To, typename... Args>
+  auto collect(Args... args) {
+    return ctx_->template collect<To>(args...);
+  }
+
+  template <typename... Args>
+  auto collect(Args... args) {
+    return ctx_->collect(args...);
+  }
+
+  // first row and first col
+  template <typename... Args>
+  auto scalar(Args... args) {
+    return ctx_->scalar(args...);
   }
 
   struct stage_offset {
     std::shared_ptr<context> ctx;
 
-    template <typename U = T>
-    auto collect() {
-      return ctx->template collect();
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
     }
   };
 
@@ -283,9 +480,24 @@ class query_builder {
       return stage_offset{ctx};
     }
 
-    template <typename U = T>
-    auto collect() {
-      return ctx->template collect();
+    stage_offset offset(token_t) {
+      ctx->offset_clause_.append(" offset ?  ");
+      return stage_offset{ctx};
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
     }
   };
 
@@ -297,23 +509,101 @@ class query_builder {
       return stage_limit{ctx};
     }
 
-    template <typename U = T>
-    auto collect() {
-      return ctx->template collect();
+    stage_limit limit(token_t) {
+      ctx->limit_clause_ = " LIMIT ?  ";
+      return stage_limit{ctx};
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
     }
   };
+
+  struct stage_having {
+    std::shared_ptr<context> ctx;
+    std::string cond_;
+
+    // order by
+    template <typename... Args>
+    stage_order order_by(Args... fields) {
+      ctx->order_by_clause_ = order_by_sql(fields...);
+      return stage_order{ctx};
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
+    }
+  };
+
+  struct stage_group_by {
+    std::shared_ptr<context> ctx;
+
+    // order by
+    template <typename... Args>
+    stage_order order_by(Args... fields) {
+      ctx->order_by_clause_ = order_by_sql(fields...);
+      return stage_order{ctx};
+    }
+
+    // having
+    stage_having having(auto cond) {
+      ctx->having_clause_ = " HAVING ";
+      ctx->having_clause_.append(cond.to_sql());
+      return stage_having{ctx};
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
+    }
+  };
+
+  template <typename... Args>
+  stage_group_by group_by(Args... fields) {
+    ctx_->group_by_clause_ = " GROUP BY ";
+    (ctx_->group_by_clause_.append(fields.name).append(","), ...);
+    ctx_->group_by_clause_.pop_back();
+    return stage_group_by{ctx_};
+  }
 
   struct stage_where {
     std::shared_ptr<context> ctx;
 
     template <typename... Args>
     stage_order order_by(Args... fields) {
-      ctx->order_by_clause_ = " ORDER BY ";
-      (ctx->order_by_clause_.append(fields.name)
-           .append(fields.sort_order)
-           .append(","),
-       ...);
-      ctx->order_by_clause_.pop_back();
+      ctx->order_by_clause_ = order_by_sql(fields...);
       return stage_order{ctx};
     }
 
@@ -322,9 +612,36 @@ class query_builder {
       return stage_limit{ctx};
     }
 
-    template <typename U = T>
-    auto collect() {
-      return ctx->template collect();
+    stage_limit limit(token_t) {
+      ctx->limit_c = " LIMIT ?  ";
+      return stage_limit{ctx};
+    }
+
+    template <typename... Args>
+    stage_group_by group_by(Args... fields) {
+      ctx->group_by_clause_ = " GROUP BY ";
+      (ctx->group_by_clause_.append(fields.class_name)
+           .append(".")
+           .append(fields.name)
+           .append(","),
+       ...);
+      ctx->group_by_clause_.pop_back();
+      return stage_group_by{ctx};
+    }
+
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
     }
   };
 
@@ -333,19 +650,65 @@ class query_builder {
     return stage_where{ctx_};
   }
 
-  struct stage_from {
+  struct stage_inner_join {
     std::shared_ptr<context> ctx;
+
+    stage_inner_join& inner_join(auto field1, auto field2) {
+      std::string sql = join_impl<T>(" inner ", field1, field2);
+      ctx->join_clause_.append(sql);
+      return *this;
+    }
 
     stage_where where(const where_condition& condition) {
       ctx->where_clause_ = condition.to_sql();
       return stage_where{ctx};
     }
 
-    template <typename U = T>
-    auto collect() {
-      return ctx->template collect();
+    template <typename To, typename... Args>
+    auto collect(Args... args) {
+      return ctx->template collect<To>(args...);
+    }
+
+    template <typename... Args>
+    auto collect(Args... args) {
+      return ctx->collect(args...);
+    }
+
+    template <typename... Args>
+    auto scalar(Args... args) {
+      return ctx->scalar(args...);
     }
   };
+
+  auto inner_join(auto field1, auto field2) {
+    std::string sql = join_impl<T>(" inner ", field1, field2);
+    ctx_->join_clause_ = sql;
+    return stage_inner_join{ctx_};
+  }
+
+  auto left_join(auto field1, auto field2) {
+    std::string sql = join_impl<T>(" left ", field1, field2);
+    ctx_->join_clause_ = sql;
+    return stage_inner_join{ctx_};
+  }
+
+  auto right_join(auto field1, auto field2) {
+    std::string sql = join_impl<T>(" right ", field1, field2);
+    ctx_->join_clause_ = sql;
+    return stage_inner_join{ctx_};
+  }
+
+  auto full_join(auto field1, auto field2) {
+    std::string sql = join_impl<T>(" full ", field1, field2);
+    ctx_->join_clause_ = sql;
+    return stage_inner_join{ctx_};
+  }
+
+  auto full_outer_join(auto field1, auto field2) {
+    std::string sql = join_impl<T>(" full outer ", field1, field2);
+    ctx_->join_clause_ = sql;
+    return stage_inner_join{ctx_};
+  }
 
  private:
   friend struct stage_select<DB, R>;
@@ -356,6 +719,7 @@ class query_builder {
 
 template <typename DB, typename R = void>
 struct stage_select {
+  using ResultType = R;
   DB db_;
   std::string select_clause_;
 
@@ -374,108 +738,50 @@ struct stage_select {
 template <typename T>
 concept HasName = requires(T t) { t.name; };
 
-template <typename DB, typename... Args>
-stage_select<DB, std::tuple<typename Args::value_type...>> select(
-    DB db, Args... args) {
-  static_assert(sizeof...(Args) > 0, "must choose at least one field");
-  using Tuple = std::tuple<typename Args::value_type...>;
-  stage_select<DB, Tuple> sel{db};
+template <typename Arg>
+auto append_select(auto& sel, Arg arg) {
+  if (arg.class_name.empty()) {
+    sel.select_clause_.append(arg.name).append(",");
+    return;
+  }
 
-  (sel.select_clause_.append(args.class_name)
-       .append(".")
-       .append(args.name)
-       .append(","),
-   ...);
+  sel.select_clause_.append(arg.class_name)
+      .append(".")
+      .append(arg.name)
+      .append(",");
+}
+
+template <typename R, typename DB, typename... Args>
+auto create_stage_select(DB db, Args... args) {
+  stage_select<DB, R> sel{db};
+  (append_select(sel, args), ...);
   sel.select_clause_.pop_back();
 
   return sel;
 }
+
+template <typename DB, typename... Args>
+auto select(DB db, Args... args) {
+  static_assert(sizeof...(Args) > 0, "must choose at least one field");
+  using Tuple = std::tuple<typename Args::value_type...>;
+  using First = std::tuple_element_t<0, Tuple>;
+  using ArgType = std::tuple_element_t<0, std::tuple<Args...>>;
+  if constexpr (std::tuple_size_v<Tuple> == 1 &&
+                std::is_same_v<ArgType, aggregate_field<First>>) {
+    return create_stage_select<First>(db, args...);
+  }
+  else {
+    return create_stage_select<Tuple>(db, args...);
+  }
+}
+
+struct all_t {};
+
+inline constexpr auto all = all_t{};
 
 template <typename DB>
 stage_select<DB, void> select_all(DB db) {
   return stage_select<DB>{db};
 }
 
-enum class aggregate_type { COUNT, SUM, AVG, MIN, MAX };
-
-template <typename DB>
-struct stage_aggregate_t {
-  DB db_;
-  std::string aggregate_clause_;
-  aggregate_type type_;
-
-  template <typename T>
-  query_builder<T, DB, uint64_t> from() {
-    auto builder = query_builder<T, DB, uint64_t>{db_};
-    set_clause(builder);
-    return builder;
-  }
-
- private:
-  void set_clause(auto& builder) {
-    switch (type_) {
-      case aggregate_type::COUNT:
-        builder.ctx_->count_clause_ = aggregate_clause_;
-        break;
-      case aggregate_type::SUM:
-        builder.ctx_->sum_clause_ = aggregate_clause_;
-        break;
-      case aggregate_type::AVG:
-        builder.ctx_->avg_clause_ = aggregate_clause_;
-        break;
-      case aggregate_type::MIN:
-        builder.ctx_->min_clause_ = aggregate_clause_;
-        break;
-      case aggregate_type::MAX:
-        builder.ctx_->max_clause_ = aggregate_clause_;
-        break;
-    }
-  }
-};
-
-template <typename DB>
-auto select_count(DB db) {
-  // include null
-  return stage_aggregate_t<DB>{db, "COUNT(*)", aggregate_type::COUNT};
-}
-
-template <typename DB>
-auto build_aggregate(DB db, std::string clause, const auto& field,
-                     aggregate_type type) {
-  std::string str;
-  str.append(clause).append(field.name).append(") ");
-  return stage_aggregate_t<DB>{db, str, aggregate_type::COUNT};
-}
-
-template <typename DB>
-auto select_count(DB db, const auto& field) {
-  // exclude null
-  return build_aggregate(db, " COUNT(", field, aggregate_type::COUNT);
-}
-
-template <typename DB>
-auto select_count_distinct(DB db, const auto& field) {
-  // distinct count, exclude null
-  return build_aggregate(db, " COUNT(DISTINCT ", field, aggregate_type::COUNT);
-}
-
-template <typename DB>
-auto select_sum(DB db, const auto& field) {
-  return build_aggregate(db, " SUM(", field, aggregate_type::SUM);
-}
-
-template <typename DB>
-auto select_avg(DB db, const auto& field) {
-  return build_aggregate(db, " AVG(", field, aggregate_type::AVG);
-}
-
-template <typename DB>
-auto select_min(DB db, const auto& field) {
-  return build_aggregate(db, " MIN(", field, aggregate_type::MIN);
-}
-
-template <typename DB>
-auto select_max(DB db, const auto& field) {
-  return build_aggregate(db, " MAX(", field, aggregate_type::MAX);
-}
 }  // namespace ormpp
