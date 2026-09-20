@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -57,6 +58,21 @@ struct simple {
   std::array<char, 128> arr;
 };
 
+struct wuliao_index_info {
+  int id;
+  int number;
+  static constexpr std::string_view get_alias_struct_name(wuliao_index_info *) {
+    return "yj_wuliaoindex";
+  }
+};
+REGISTER_AUTO_KEY(wuliao_index_info, id)
+
+struct no_key_update_info {
+  int id;
+  double code;
+  int age;
+};
+
 struct builder_person {
   std::string name;
   int age;
@@ -75,6 +91,163 @@ struct ormpp_partition_log {
   std::string payload;
 };
 
+struct db_field_type_entity {
+  int id;
+  ormpp::date birthday;
+  ormpp::time start_time;
+  ormpp::datetime created_at;
+  ormpp::timestamp updated_at;
+  ormpp::decimal<10, 2> amount;
+  std::optional<ormpp::datetime> deleted_at;
+  std::optional<ormpp::decimal<12, 4>> ratio;
+};
+REGISTER_AUTO_KEY(db_field_type_entity, id)
+
+inline db_field_type_entity make_db_field_type_entity(
+    bool include_optional_values = false) {
+  db_field_type_entity item{};
+  item.birthday = "2026-08-23";
+  item.start_time = "16:30:45";
+  item.created_at = "2026-08-23 16:30:45";
+  item.updated_at = "2026-08-23 16:31:00";
+  item.amount = "12345678.90";
+  if (include_optional_values) {
+    item.deleted_at = ormpp::datetime{"2026-08-24 00:00:00"};
+    item.ratio = ormpp::decimal<12, 4>{"12.3456"};
+  }
+  else {
+    item.deleted_at = std::nullopt;
+    item.ratio = ormpp::decimal<12, 4>{"12.3456"};
+  }
+  return item;
+}
+
+inline db_field_type_entity make_updated_db_field_type_entity(
+    db_field_type_entity item) {
+  item.birthday = "2026-08-24";
+  item.start_time = "17:31:46";
+  item.created_at = "2026-08-24 17:31:46";
+  item.updated_at = "2026-08-24 17:32:00";
+  item.amount = "87654321.09";
+  item.deleted_at = ormpp::datetime{"2026-08-25 00:00:00"};
+  item.ratio = ormpp::decimal<12, 4>{"98.7654"};
+  return item;
+}
+
+inline void check_db_field_type_entity(const db_field_type_entity &actual,
+                                       const db_field_type_entity &expected) {
+  CHECK(actual.birthday.value == expected.birthday.value);
+  CHECK(actual.start_time.value == expected.start_time.value);
+  CHECK(actual.created_at.value == expected.created_at.value);
+  CHECK(actual.updated_at.value == expected.updated_at.value);
+  CHECK(actual.amount.value == expected.amount.value);
+  CHECK(actual.deleted_at.has_value() == expected.deleted_at.has_value());
+  if (expected.deleted_at.has_value()) {
+    CHECK(actual.deleted_at->value == expected.deleted_at->value);
+  }
+  REQUIRE(actual.ratio.has_value());
+  REQUIRE(expected.ratio.has_value());
+  CHECK(actual.ratio->value == expected.ratio->value);
+}
+
+template <typename DB>
+inline void check_db_field_type_crud(DB &database,
+                                     std::string_view id_condition) {
+  auto item = make_db_field_type_entity(true);
+  CHECK(database.insert(item) == 1);
+
+  auto rows = database.template query_s<db_field_type_entity>();
+  REQUIRE(rows.size() == 1);
+  check_db_field_type_entity(rows.front(), item);
+
+  auto updated = make_updated_db_field_type_entity(rows.front());
+  CHECK(database.update(updated) == 1);
+
+  auto updated_rows = database.template query_s<db_field_type_entity>(
+      std::string(id_condition), updated.id);
+  REQUIRE(updated_rows.size() == 1);
+  check_db_field_type_entity(updated_rows.front(), updated);
+
+  CHECK(database.template delete_records_s<db_field_type_entity>(
+            std::string(id_condition), updated.id) == 1);
+  CHECK(database.template query_s<db_field_type_entity>().empty());
+}
+
+template <typename DB>
+inline void check_db_field_type_optional_null(DB &database,
+                                              std::string_view id_condition) {
+  auto item = make_db_field_type_entity(false);
+  CHECK(database.insert(item) == 1);
+
+  auto rows = database.template query_s<db_field_type_entity>();
+  REQUIRE(rows.size() == 1);
+  check_db_field_type_entity(rows.front(), item);
+
+  CHECK(database.template delete_records_s<db_field_type_entity>(
+            std::string(id_condition), rows.front().id) == 1);
+  CHECK(database.template query_s<db_field_type_entity>().empty());
+}
+
+TEST_CASE("database field type mappings") {
+  auto mysql_types = get_type_names<db_field_type_entity>(DBType::mysql);
+  CHECK(mysql_types[1] == "DATE");
+  CHECK(mysql_types[2] == "TIME");
+  CHECK(mysql_types[3] == "DATETIME");
+  CHECK(mysql_types[4] == "TIMESTAMP");
+  CHECK(mysql_types[5] == "DECIMAL(10,2)");
+  CHECK(mysql_types[6] == "DATETIME");
+  CHECK(mysql_types[7] == "DECIMAL(12,4)");
+
+  auto pg_types = get_type_names<db_field_type_entity>(DBType::postgresql);
+  CHECK(pg_types[1] == "date");
+  CHECK(pg_types[2] == "time");
+  CHECK(pg_types[3] == "timestamp");
+  CHECK(pg_types[4] == "timestamp");
+  CHECK(pg_types[5] == "numeric(10,2)");
+  CHECK(pg_types[6] == "timestamp");
+  CHECK(pg_types[7] == "numeric(12,4)");
+
+  auto sqlite_types = get_type_names<db_field_type_entity>(DBType::sqlite);
+  for (std::size_t i = 1; i < sqlite_types.size(); ++i) {
+    CHECK(sqlite_types[i] == "TEXT");
+  }
+}
+
+TEST_CASE("sqlite database field types CRUD as text values") {
+  dbng<sqlite> sqlite;
+  REQUIRE(sqlite.connect(":memory:"));
+  REQUIRE(sqlite.create_datatable<db_field_type_entity>(ormpp_auto_key{"id"}));
+
+  check_db_field_type_crud(sqlite, "id=?");
+  check_db_field_type_optional_null(sqlite, "id=?");
+}
+
+TEST_CASE("mysql database field types CRUD as text values") {
+#ifdef ORMPP_ENABLE_MYSQL
+  dbng<mysql> mysql;
+  if (mysql.connect(ip, username, password, db)) {
+    mysql.execute("drop table if exists db_field_type_entity");
+    REQUIRE(mysql.create_datatable<db_field_type_entity>(ormpp_auto_key{"id"}));
+
+    check_db_field_type_crud(mysql, "id=?");
+    check_db_field_type_optional_null(mysql, "id=?");
+  }
+#endif
+}
+
+TEST_CASE("postgresql database field types CRUD as text values") {
+#ifdef ORMPP_ENABLE_PG
+  dbng<postgresql> postgres;
+  if (postgres.connect(ip, username, password, db, 5)) {
+    postgres.execute("drop table if exists db_field_type_entity");
+    REQUIRE(
+        postgres.create_datatable<db_field_type_entity>(ormpp_auto_key{"id"}));
+
+    check_db_field_type_crud(postgres, "id=$1");
+  }
+#endif
+}
+
 TEST_CASE("test mysql long string") {
 #ifdef ORMPP_ENABLE_MYSQL
   dbng<mysql> mysql;
@@ -83,6 +256,21 @@ TEST_CASE("test mysql long string") {
         "SELECT REPEAT('A', 65537) AS long_string");
     CHECK(vec.size() == 1);
     CHECK(std::get<0>(vec[0]).length() == 65537);
+
+    auto empty_vec =
+        mysql.query_s<std::tuple<std::string>>("SELECT '' AS empty_string");
+    CHECK(empty_vec.size() == 1);
+    CHECK(std::get<0>(empty_vec[0]).empty());
+
+    auto null_vec = mysql.query_s<std::tuple<std::optional<std::string>>>(
+        "SELECT ?", static_cast<const char *>(nullptr));
+    CHECK(null_vec.size() == 1);
+    CHECK(!std::get<0>(null_vec[0]).has_value());
+
+    auto wrapper_vec = mysql.query_s<std::tuple<std::string>>(
+        "SELECT ?", ormpp::date{"2026-08-24"});
+    CHECK(wrapper_vec.size() == 1);
+    CHECK(std::get<0>(wrapper_vec[0]) == "2026-08-24");
   }
 #endif
 }
@@ -170,6 +358,21 @@ struct test_optional {
   std::optional<int> empty_;
 };
 REGISTER_AUTO_KEY(test_optional, id)
+
+struct Person {
+  std::string name;
+  int age;
+  int id;
+};
+REGISTER_AUTO_KEY(Person, id)
+
+struct Append {
+  int id;
+  std::optional<std::string> name;
+  std::optional<int> age;
+  std::optional<int> empty;
+};
+REGISTER_AUTO_KEY(Append, id)
 
 struct sub_optinal {
   std::optional<std::string> name;
@@ -805,6 +1008,29 @@ TEST_CASE("optional") {
                     .where(col(&person::id) > 0 || col(&person::id) == 1)
                     .collect();
       CHECK(l2.size() == 1);
+
+      auto all_join_rows =
+          sqlite.select(all)
+              .from<test_optional>()
+              .inner_join(col(&test_optional::id), col(&person::id))
+              .where(col(&test_optional::id) == 1)
+              .collect();
+      REQUIRE(all_join_rows.size() == 1);
+      CHECK(all_join_rows.front().id == 1);
+
+      auto grouped_all_rows = sqlite.select(all)
+                                  .from<test_optional>()
+                                  .group_by(col(&test_optional::id))
+                                  .collect();
+      CHECK(grouped_all_rows.size() == 2);
+
+      auto limited_all_rows = sqlite.select(all)
+                                  .from<test_optional>()
+                                  .order_by(col(&test_optional::id).desc())
+                                  .limit(1)
+                                  .collect();
+      REQUIRE(limited_all_rows.size() == 1);
+      CHECK(limited_all_rows.front().id == 2);
       sqlite.execute("DROP TABLE IF EXISTS person");
     }
     auto l0 = sqlite.select(all)
@@ -843,9 +1069,36 @@ TEST_CASE("optional") {
                   .from<test_optional>()
                   .where(col(&test_optional::name).in("test", "purecpp"))
                   .collect();
+    std::vector<int> ids_vector{1, 2};
+    auto l2_vector = sqlite.select(all)
+                         .from<test_optional>()
+                         .where(col(&test_optional::id).in(ids_vector))
+                         .collect();
+    auto ids_from_sql = sqlite.select(col(&test_optional::id))
+                            .from<test_optional>()
+                            .where(col(&test_optional::name) == "test")
+                            .collect();
+    auto l2_from_sql = sqlite.select(all)
+                           .from<test_optional>()
+                           .where(col(&test_optional::id).in(ids_from_sql))
+                           .collect();
+    std::vector<int> empty_ids;
+    auto empty_in = sqlite.select(all)
+                        .from<test_optional>()
+                        .where(col(&test_optional::id).in(empty_ids))
+                        .collect();
+    auto empty_not_in = sqlite.select(all)
+                            .from<test_optional>()
+                            .where(col(&test_optional::id).not_in(empty_ids))
+                            .collect();
     CHECK(l0.size() == 2);
     CHECK(l1.size() == 2);
     CHECK(l2.size() == 2);
+    CHECK(l2_vector.size() == 2);
+    CHECK(l2_from_sql.size() == 1);
+    CHECK(l2_from_sql.front().id == 2);
+    CHECK(empty_in.empty());
+    CHECK(empty_not_in.size() == 2);
 
     auto l3 = sqlite.select(all)
                   .from<test_optional>()
@@ -897,9 +1150,75 @@ TEST_CASE("optional") {
 TEST_CASE("like condition quotes and escapes string patterns") {
   std::string_view pattern = "pure%";
   CHECK(col(&test_optional::name).like(pattern).to_sql() ==
-        "(name like 'pure%')");
+        "(test_optional.name like 'pure%')");
   CHECK(col(&test_optional::name).like("a'b%").to_sql() ==
-        "(name like 'a''b%')");
+        "(test_optional.name like 'a''b%')");
+}
+
+TEST_CASE("in condition accepts ranges") {
+  std::vector<int> ids{1, 2, 3};
+  CHECK(col(&test_optional::id).in(ids).to_sql() ==
+        "(test_optional.id in(1,2,3))");
+
+  std::array<int, 2> id_array{1, 2};
+  CHECK(col(&test_optional::id).not_in(id_array).to_sql() ==
+        "(test_optional.id not in(1,2))");
+
+  std::vector<std::string> names{"test", "a'b"};
+  CHECK(col(&test_optional::name).in(names).to_sql() ==
+        "(test_optional.name in('test','a''b'))");
+
+  std::vector<std::tuple<int>> id_rows{{1}, {2}};
+  CHECK(col(&test_optional::id).in(id_rows).to_sql() ==
+        "(test_optional.id in(1,2))");
+
+  std::vector<int> empty_ids;
+  CHECK(col(&test_optional::id).in(empty_ids).to_sql() == "(1=0)");
+  CHECK(col(&test_optional::id).not_in(empty_ids).to_sql() == "(1=1)");
+}
+
+TEST_CASE("issue #269: sqlite select all with inner join") {
+  dbng<sqlite> db;
+  REQUIRE(db.connect("test_select_all_issue_269.db"));
+  db.execute("DROP TABLE IF EXISTS Person");
+  db.execute("DROP TABLE IF EXISTS Append");
+  REQUIRE(db.create_datatable<Person>());
+  REQUIRE(db.create_datatable<Append>());
+  REQUIRE(db.insert<Person>({"purecpp", 18, 0}) == 1);
+  REQUIRE(db.insert<Append>({0, "purecpp", 18, {}}) == 1);
+
+  auto ret = db.select(ormpp::all)
+                 .from<Append>()
+                 .inner_join(ormpp::col(&Person::id), ormpp::col(&Append::id))
+                 .where(ormpp::col(&Append::id) == 1)
+                 .collect();
+
+  REQUIRE(ret.size() == 1);
+  CHECK(ret.front().id == 1);
+  REQUIRE(ret.front().name.has_value());
+  CHECK(ret.front().name.value() == "purecpp");
+
+  db.execute("DROP TABLE IF EXISTS Person");
+  db.execute("DROP TABLE IF EXISTS Append");
+}
+
+TEST_CASE("query condition containing select is not treated as full SQL") {
+  CHECK(!contains_select("id in (select id from person)"));
+
+  auto sql = generate_query_sql<person>(DBType::sqlite,
+                                        "id in (select id from person)");
+  CHECK(sql.find("select ") == 0);
+  CHECK(sql.find("where 1=1 and  id in (select id from person)") !=
+        std::string::npos);
+}
+
+TEST_CASE("postgresql placeholder replacement skips SQL literals") {
+  CHECK(replace_postgresql_placeholders(
+            "select * from person where name='a?b' and id=?") ==
+        "select * from person where name='a?b' and id=$1");
+  CHECK(replace_postgresql_placeholders(
+            "select '?' as q, name from person where id=? limit ?  ") ==
+        "select '?' as q, name from person where id=$1 limit $2  ");
 }
 
 /*
@@ -3521,6 +3840,16 @@ TEST_CASE("test get_conflict_keys function") {
     auto key6s = ormpp::get_conflict_keys<simple>(db_type);
     CHECK(key6s.empty());
   }
+}
+
+TEST_CASE(
+    "generate update sql trims trailing spaces without dropping predicates") {
+  CHECK(ormpp::generate_update_sql<wuliao_index_info>(DBType::mysql) ==
+        "update yj_wuliaoindex set `id`=?,`number`=? where 1=1 and `id`=?");
+  CHECK(ormpp::generate_update_sql<no_key_update_info>(DBType::mysql).empty());
+  CHECK(ormpp::generate_update_sql<no_key_update_info>(DBType::mysql, "id=1") ==
+        "update no_key_update_info set `id`=?,`code`=?,`age`=? where 1=1 and "
+        "id=1");
 }
 
 TEST_CASE("create table with namespace") {

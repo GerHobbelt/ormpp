@@ -169,7 +169,8 @@ class postgresql {
   template <typename T, typename... Args>
   std::enable_if_t<iguana::ylt_refletable_v<T>, std::vector<T>> query_s(
       const std::string &str, Args &&...args) {
-    std::string sql = generate_query_sql<T>(db_type_v, str);
+    std::string sql =
+        contains_select(str) ? str : generate_query_sql<T>(db_type_v, str);
 #ifdef ORMPP_ENABLE_LOG
     std::cout << sql << std::endl;
 #endif
@@ -648,21 +649,27 @@ class postgresql {
 
   template <auto... members, typename T, typename... Args>
   int update_impl(const T &t, Args &&...args) {
-    auto res = insert_or_update_impl<members...>(
-        t,
-        generate_update_sql<T, members...>(db_type_v,
-                                           std::forward<Args>(args)...),
-        OptType::update, false, std::forward<Args>(args)...);
+    auto sql = generate_update_sql<T, members...>(db_type_v,
+                                                  std::forward<Args>(args)...);
+    if (sql.empty()) {
+      set_last_error("update requires a conflict key or where condition");
+      return INT_MIN;
+    }
+    auto res = insert_or_update_impl<members...>(t, sql, OptType::update, false,
+                                                 std::forward<Args>(args)...);
     return res.has_value() ? res.value() : INT_MIN;
   }
 
   template <auto... members, typename T, typename... Args>
   int update_impl(const std::vector<T> &v, Args &&...args) {
-    auto res = insert_or_update_impl<members...>(
-        v,
-        generate_update_sql<T, members...>(db_type_v,
-                                           std::forward<Args>(args)...),
-        OptType::update, false, std::forward<Args>(args)...);
+    auto sql = generate_update_sql<T, members...>(db_type_v,
+                                                  std::forward<Args>(args)...);
+    if (sql.empty()) {
+      set_last_error("update requires a conflict key or where condition");
+      return INT_MIN;
+    }
+    auto res = insert_or_update_impl<members...>(v, sql, OptType::update, false,
+                                                 std::forward<Args>(args)...);
     return res.has_value() ? res.value() : INT_MIN;
   }
 
@@ -762,6 +769,13 @@ class postgresql {
                 std::back_inserter(temp));
       param_values.push_back(std::move(temp));
     }
+    else if constexpr (is_db_text_type_v<U>) {
+      std::vector<char> temp = {};
+      std::copy(value.data(), value.data() + value.size(),
+                std::back_inserter(temp));
+      temp.push_back('\0');
+      param_values.push_back(std::move(temp));
+    }
     else if constexpr (iguana::c_array_v<U>) {
       std::vector<char> temp = {};
       std::copy(value, value + sizeof(U), std::back_inserter(temp));
@@ -817,6 +831,9 @@ class postgresql {
     else if constexpr (std::is_same_v<std::string_view, U>) {
       sv_ = PQgetvalue(res_, row, i);
       value = sv_;
+    }
+    else if constexpr (is_db_text_type_v<U>) {
+      value.value = PQgetvalue(res_, row, i);
     }
     else if constexpr (iguana::array_v<U>) {
       auto p = PQgetvalue(res_, row, i);

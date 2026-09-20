@@ -1198,8 +1198,19 @@ ormpp 自动将 C++ 类型映射为对应数据库的 SQL 类型：
 | `std::string_view` | TEXT | text | TEXT |
 | `std::array<char, N>` | VARCHAR(N) | varchar(N) | VARCHAR(N) |
 | `blob` (std::vector<char>) | BLOB | bytea | BLOB |
+| `ormpp::date` | DATE | date | TEXT |
+| `ormpp::time` | TIME | time | TEXT |
+| `ormpp::datetime` | DATETIME | timestamp | TEXT |
+| `ormpp::timestamp` | TIMESTAMP | timestamp | TEXT |
+| `ormpp::decimal<P, S>` | DECIMAL(P,S) | numeric(P,S) | TEXT |
 | `enum` / `enum class` | INTEGER | integer | INTEGER |
 | `std::optional<T>` | 同 T 类型 | 同 T 类型 | 同 T 类型 |
+
+`ormpp::date`、`ormpp::time`、`ormpp::datetime`、`ormpp::timestamp`
+和 `ormpp::decimal<P, S>` 是轻量文本包装类型，ormpp 负责生成对应字段类型并按文本绑定/读取，
+不做日期格式、时间范围或 decimal 精度校验。
+查询结果中的 `std::string_view` 指向 ormpp 内部临时存储，仅适合立即读取；需要跨行或跨查询保存时请使用
+`std::string`。
 
 ## 连接池
 

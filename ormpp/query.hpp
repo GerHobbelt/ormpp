@@ -1,5 +1,9 @@
 #pragma once
+#include <iterator>
 #include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 #include "async_traits.hpp"
 #include "utility.hpp"
@@ -24,6 +28,32 @@ struct where_condition {
     return sql;
   }
 };
+
+template <typename T, typename = void>
+struct is_in_condition_range : std::false_type {};
+
+template <typename T>
+struct is_in_condition_range<
+    T, std::void_t<decltype(std::begin(std::declval<T&>())),
+                   decltype(std::end(std::declval<T&>()))>>
+    : std::bool_constant<
+          !iguana::string_container_v<T> && !iguana::map_container_v<T> &&
+          !(std::is_array_v<std::remove_cvref_t<T>> &&
+            iguana::char_v<std::remove_extent_t<std::remove_cvref_t<T>>>)> {};
+
+template <typename T>
+inline constexpr bool is_in_condition_range_v =
+    is_in_condition_range<std::remove_cvref_t<T>>::value;
+
+inline std::string qualified_field_name(std::string_view class_name,
+                                        std::string_view name) {
+  std::string str;
+  if (!class_name.empty()) {
+    str.append(class_name).append(".");
+  }
+  str.append(name);
+  return str;
+}
 
 template <typename M>
 struct col_info {
@@ -50,27 +80,27 @@ struct col_info {
   }
 
   template <typename... Args>
-  where_condition in(Args... args) {
-    return in_impl("", args...);
+  where_condition in(Args&&... args) {
+    return in_impl("", std::forward<Args>(args)...);
   }
 
   template <typename... Args>
-  where_condition not_in(Args... args) {
-    return in_impl("not", args...);
+  where_condition not_in(Args&&... args) {
+    return in_impl("not", std::forward<Args>(args)...);
   }
 
   where_condition null() {
-    return where_condition{std::string(name), " IS ", "NULL"};
+    return where_condition{qualified_name(), " IS ", "NULL"};
   }
 
   where_condition not_null() {
-    return where_condition{std::string(name), " IS ", "NOT NULL"};
+    return where_condition{qualified_name(), " IS ", "NOT NULL"};
   }
 
   template <typename T>
   where_condition between(T left, T right) {
-    std::string str_left;
-    str_left.append(name).append(" between ").append(to_string(left));
+    std::string str_left = qualified_name();
+    str_left.append(" between ").append(to_string(left));
 
     std::string str_right;
     str_right.append(to_string(right));
@@ -81,10 +111,14 @@ struct col_info {
     static_assert(std::is_constructible_v<M, std::string> ||
                       std::is_constructible_v<M, std::string_view>,
                   "invalid type");
-    return where_condition{std::string(name), " like ", format_string(str)};
+    return where_condition{qualified_name(), " like ", format_string(str)};
   }
 
  private:
+  std::string qualified_name() const {
+    return qualified_field_name(class_name, name);
+  }
+
   static std::string format_string(std::string_view s) {
     std::string str = "'";
     str.append(escape_sql_string(s)).append("'");
@@ -94,7 +128,11 @@ struct col_info {
   template <typename value_type>
   std::string to_string(value_type val) {
     static_assert(std::is_constructible_v<M, value_type>, "invalid type");
-    if constexpr (std::is_arithmetic_v<value_type>) {
+    if constexpr (std::is_enum_v<value_type>) {
+      using underlying = std::underlying_type_t<value_type>;
+      return std::to_string(static_cast<underlying>(val));
+    }
+    else if constexpr (std::is_arithmetic_v<value_type>) {
       return std::to_string(val);
     }
     else {
@@ -103,14 +141,64 @@ struct col_info {
   }
 
   template <typename... Args>
-  where_condition in_impl(std::string s, Args... args) {
+  where_condition in_impl(std::string s, Args&&... args) {
+    static_assert(sizeof...(Args) > 0,
+                  "in() requires at least one value or range");
     std::string mid;
-    (mid.append(to_string(args)).append(","), ...);
+    if constexpr (sizeof...(Args) == 1 &&
+                  (is_in_condition_range_v<Args> && ...)) {
+      (
+          [&](auto&& range) {
+            for (auto&& value : range) {
+              append_in_value(mid, std::forward<decltype(value)>(value));
+            }
+          }(std::forward<Args>(args)),
+          ...);
+    }
+    else {
+      static_assert((!is_in_condition_range_v<Args> && ...),
+                    "in() accepts either scalar values or one range");
+      (append_in_value(mid, std::forward<Args>(args)), ...);
+    }
+
+    if (mid.empty()) {
+      return empty_in_condition(s);
+    }
     mid.pop_back();
 
-    std::string left;
-    left.append(name).append(" ").append(s).append(" in(");
-    return where_condition{left, mid, ")"};
+    return make_in_condition(std::move(s), std::move(mid));
+  }
+
+  template <typename Arg>
+  void append_in_value(std::string& mid, Arg&& arg) {
+    mid.append(in_value_to_string(std::forward<Arg>(arg))).append(",");
+  }
+
+  template <typename Arg>
+  std::string in_value_to_string(Arg&& arg) {
+    using arg_type = std::remove_cvref_t<Arg>;
+    if constexpr (iguana::tuple_v<arg_type>) {
+      static_assert(std::tuple_size_v<arg_type> == 1,
+                    "tuple values passed to in() must have one field");
+      return in_value_to_string(std::get<0>(std::forward<Arg>(arg)));
+    }
+    else {
+      return to_string(std::forward<Arg>(arg));
+    }
+  }
+
+  where_condition empty_in_condition(const std::string& s) const {
+    return s.empty() ? where_condition{"1", "=", "0"}
+                     : where_condition{"1", "=", "1"};
+  }
+
+  where_condition make_in_condition(std::string s, std::string mid) const {
+    std::string left = qualified_name();
+    if (!s.empty()) {
+      left.append(" ").append(s);
+    }
+    left.append(" in(");
+    return where_condition{std::move(left), std::move(mid), ")"};
   }
 };
 
@@ -448,16 +536,91 @@ std::string order_by_sql(Args... fields) {
   std::string sql = " ORDER BY ";
   (
       [&] {
-        if (fields.class_name.empty()) {
-          sql.append(fields.name);
-        }
-        else {
-          sql.append(fields.class_name).append(".").append(fields.name);
-        }
+        sql.append(qualified_field_name(fields.class_name, fields.name));
         sql.append(fields.sort_order).append(",");
       }(),
       ...);
   sql.pop_back();
+  return sql;
+}
+
+template <typename T>
+inline std::string select_all_fields_sql() {
+  std::string sql;
+  auto table_name = get_short_struct_name<T>();
+  for (const auto& name : ylt::reflection::get_member_names<T>()) {
+    sql.append(table_name).append(".").append(name).append(",");
+  }
+  if (!sql.empty()) {
+    sql.pop_back();
+  }
+  return sql;
+}
+
+inline void append_group_by_field(std::string& sql, auto field) {
+  sql.append(qualified_field_name(field.class_name, field.name)).append(",");
+}
+
+inline std::size_t find_next_postgresql_placeholder(std::string_view sql,
+                                                    std::size_t start) {
+  for (std::size_t i = start; i < sql.size(); ++i) {
+    switch (sql[i]) {
+      case '?':
+        return i;
+      case '\'':
+      case '"': {
+        const char quote = sql[i];
+        ++i;
+        while (i < sql.size()) {
+          if (sql[i] == quote) {
+            if (i + 1 < sql.size() && sql[i + 1] == quote) {
+              i += 2;
+              continue;
+            }
+            break;
+          }
+          ++i;
+        }
+        break;
+      }
+      case '-':
+        if (i + 1 < sql.size() && sql[i + 1] == '-') {
+          i += 2;
+          while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
+            ++i;
+          }
+        }
+        break;
+      case '/':
+        if (i + 1 < sql.size() && sql[i + 1] == '*') {
+          i += 2;
+          while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+            ++i;
+          }
+          if (i + 1 < sql.size()) {
+            ++i;
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return std::string_view::npos;
+}
+
+inline std::string replace_postgresql_placeholders(std::string sql) {
+  std::size_t search_pos = 0;
+  int index = 1;
+  while (true) {
+    auto pos = find_next_postgresql_placeholder(sql, search_pos);
+    if (pos == std::string_view::npos) {
+      break;
+    }
+    std::string replacement = "$" + std::to_string(index++);
+    sql.replace(pos, 1, replacement);
+    search_pos = pos + replacement.size();
+  }
   return sql;
 }
 
@@ -549,17 +712,7 @@ class query_builder {
 
       if constexpr (std::remove_pointer_t<DB>::db_type_v ==
                     DBType::postgresql) {
-        if (sql.find('?') != std::string::npos) {
-          int index = 1;
-          for (size_t i = 0; i < sql.size(); i++) {
-            if (sql[i] == '?') {
-              sql[i] = '$';
-              std::string index_str = std::to_string(index++);
-              std::memcpy(&sql[i + 1], index_str.data(),
-                          (std::min)(index_str.size(), size_t(2)));
-            }
-          }
-        }
+        sql = replace_postgresql_placeholders(std::move(sql));
       }
 
       return sql;
@@ -863,9 +1016,25 @@ class query_builder {
   template <typename... Args>
   stage_group_by group_by(Args... fields) {
     ctx_->group_by_clause_ = " GROUP BY ";
-    (ctx_->group_by_clause_.append(fields.name).append(","), ...);
+    (append_group_by_field(ctx_->group_by_clause_, fields), ...);
     ctx_->group_by_clause_.pop_back();
     return stage_group_by{ctx_};
+  }
+
+  template <typename... Args>
+  stage_order order_by(Args... fields) {
+    ctx_->order_by_clause_ = order_by_sql(fields...);
+    return stage_order{ctx_};
+  }
+
+  stage_limit limit(uint64_t n) {
+    ctx_->limit_clause_ = " LIMIT " + std::to_string(n);
+    return stage_limit{ctx_};
+  }
+
+  stage_limit limit(token_t) {
+    ctx_->limit_clause_ = " LIMIT ?  ";
+    return stage_limit{ctx_};
   }
 
   struct stage_where {
@@ -890,11 +1059,7 @@ class query_builder {
     template <typename... Args>
     stage_group_by group_by(Args... fields) {
       ctx->group_by_clause_ = " GROUP BY ";
-      (ctx->group_by_clause_.append(fields.class_name)
-           .append(".")
-           .append(fields.name)
-           .append(","),
-       ...);
+      (append_group_by_field(ctx->group_by_clause_, fields), ...);
       ctx->group_by_clause_.pop_back();
       return stage_group_by{ctx};
     }
@@ -932,6 +1097,30 @@ class query_builder {
     stage_where where(const where_condition& condition) {
       ctx->where_clause_ = condition.to_sql();
       return stage_where{ctx};
+    }
+
+    template <typename... Args>
+    stage_group_by group_by(Args... fields) {
+      ctx->group_by_clause_ = " GROUP BY ";
+      (append_group_by_field(ctx->group_by_clause_, fields), ...);
+      ctx->group_by_clause_.pop_back();
+      return stage_group_by{ctx};
+    }
+
+    template <typename... Args>
+    stage_order order_by(Args... fields) {
+      ctx->order_by_clause_ = order_by_sql(fields...);
+      return stage_order{ctx};
+    }
+
+    stage_limit limit(uint64_t n) {
+      ctx->limit_clause_ = " LIMIT " + std::to_string(n);
+      return stage_limit{ctx};
+    }
+
+    stage_limit limit(token_t) {
+      ctx->limit_clause_ = " LIMIT ?  ";
+      return stage_limit{ctx};
     }
 
     template <typename To, typename... Args>
@@ -996,11 +1185,10 @@ struct stage_select {
   template <typename T>
   query_builder<T, DB, R> from() {
     auto builder = query_builder<T, DB, R>{db_};
-    if (!select_clause_.empty()) {
-      builder.ctx_->select_clause_ = select_clause_;
-      builder.ctx_->from_clause_.append(" from ").append(
-          std::string(get_short_struct_name<T>()));
-    }
+    builder.ctx_->select_clause_ =
+        select_clause_.empty() ? select_all_fields_sql<T>() : select_clause_;
+    builder.ctx_->from_clause_.append(" from ").append(
+        std::string(get_short_struct_name<T>()));
     return builder;
   }
 };

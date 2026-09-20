@@ -200,7 +200,8 @@ class sqlite {
   template <typename T, typename... Args>
   std::enable_if_t<iguana::ylt_refletable_v<T>, std::vector<T>> query_s(
       const std::string &str, Args &&...args) {
-    std::string sql = generate_query_sql<T>(db_type_v, str);
+    std::string sql =
+        contains_select(str) ? str : generate_query_sql<T>(db_type_v, str);
 #ifdef ORMPP_ENABLE_LOG
     std::cout << sql << std::endl;
 #endif
@@ -662,6 +663,10 @@ class sqlite {
       return SQLITE_OK ==
              sqlite3_bind_text(stmt_, i, value.data(), len, nullptr);
     }
+    else if constexpr (is_db_text_type_v<U>) {
+      return SQLITE_OK ==
+             sqlite3_bind_text(stmt_, i, value.data(), value.size(), nullptr);
+    }
     else if constexpr (iguana::c_array_v<U> ||
                        std::is_same_v<char,
                                       std::remove_pointer_t<std::decay_t<U>>>) {
@@ -726,6 +731,15 @@ class sqlite {
                  (size_t)sqlite3_column_bytes(stmt_, i));
       value = sv_;
     }
+    else if constexpr (is_db_text_type_v<U>) {
+      auto text = reinterpret_cast<const char *>(sqlite3_column_text(stmt_, i));
+      if (text == nullptr) {
+        value.value.clear();
+      }
+      else {
+        value.value.assign(text, (size_t)sqlite3_column_bytes(stmt_, i));
+      }
+    }
     else if constexpr (iguana::array_v<U>) {
       memcpy(value.data(), sqlite3_column_text(stmt_, i), sizeof(U));
     }
@@ -762,21 +776,27 @@ class sqlite {
 
   template <auto... members, typename T, typename... Args>
   int update_impl(const T &t, Args &&...args) {
-    auto res = insert_or_update_impl<members...>(
-        t,
-        generate_update_sql<T, members...>(db_type_v,
-                                           std::forward<Args>(args)...),
-        OptType::update, false, std::forward<Args>(args)...);
+    auto sql = generate_update_sql<T, members...>(db_type_v,
+                                                  std::forward<Args>(args)...);
+    if (sql.empty()) {
+      set_last_error("update requires a conflict key or where condition");
+      return INT_MIN;
+    }
+    auto res = insert_or_update_impl<members...>(t, sql, OptType::update, false,
+                                                 std::forward<Args>(args)...);
     return res.has_value() ? res.value() : INT_MIN;
   }
 
   template <auto... members, typename T, typename... Args>
   int update_impl(const std::vector<T> &v, Args &&...args) {
-    auto res = insert_or_update_impl<members...>(
-        v,
-        generate_update_sql<T, members...>(db_type_v,
-                                           std::forward<Args>(args)...),
-        OptType::update, false, std::forward<Args>(args)...);
+    auto sql = generate_update_sql<T, members...>(db_type_v,
+                                                  std::forward<Args>(args)...);
+    if (sql.empty()) {
+      set_last_error("update requires a conflict key or where condition");
+      return INT_MIN;
+    }
+    auto res = insert_or_update_impl<members...>(v, sql, OptType::update, false,
+                                                 std::forward<Args>(args)...);
     return res.has_value() ? res.value() : INT_MIN;
   }
 
