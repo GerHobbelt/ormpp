@@ -364,6 +364,53 @@ CHECK(sqlite.remove<builder_person>()
             .execute() == 1);
 ```
 
+#### 范围分区链式调用接口
+
+范围分区通过统一的链式 API 表达，ormpp 会根据数据库类型生成不同 SQL：
+
+- MySQL：使用原生 `PARTITION BY RANGE COLUMNS`、`DELETE ... PARTITION`、`ALTER TABLE ... TRUNCATE/DROP PARTITION`
+- PostgreSQL：使用父表 `PARTITION BY RANGE` 和子分区表
+- SQLite：没有原生分区，使用分区字段范围条件模拟删除，并为分区字段创建索引
+
+例子：
+
+```cpp
+struct order_log {
+  int id;
+  int bucket;
+  std::string payload;
+};
+
+auto p202405 = ormpp::range_partition("p202405", 202405, 202406);
+auto p202406 = ormpp::range_partition("p202406", 202406, 202407);
+
+db.create_table<order_log>()
+    .primary_key(col(&order_log::id), col(&order_log::bucket))
+    .partition_by_range(col(&order_log::bucket))
+    .partition(p202405)
+    .partition(p202406)
+    .execute();
+
+// 删除一个逻辑分区中的数据
+db.remove<order_log>()
+    .partition(col(&order_log::bucket), p202405)
+    .execute_all();
+
+// 清空一个逻辑分区
+db.alter_table<order_log>()
+    .clear_partition(col(&order_log::bucket), p202406)
+    .execute();
+
+// 维护分区结构。SQLite 没有原生分区，drop_partition 会失败返回 false。
+auto p202407 = ormpp::range_partition("p202407", 202407, 202408);
+db.alter_table<order_log>()
+    .add_partition(col(&order_log::bucket), p202407)
+    .drop_partition(p202407)
+    .execute();
+```
+
+注意：分区名会按 SQL 标识符校验，只允许字母、数字和下划线，且不能以数字开头。MySQL 分区表的主键/唯一键需要满足 MySQL 自身限制，通常应包含分区字段。
+
 ## 如何编译
 
 支持的选项如下:
@@ -927,6 +974,57 @@ auto r = mysql.warper_connect<log, validate>("127.0.0.1", "root", "12345", "test
 TEST_REQUIRE(r);
 ```
 
+## 线程安全
+
+### 问题背景
+
+ormpp 底层依赖 iguana 的编译期反射。iguana 的部分反射元数据采用**懒加载（Lazy Initialization）**策略：首次查询某个实体类型时才会初始化字段映射信息。
+
+在多线程场景下，如果多个线程**同时首次查询同一类型**，可能因并发初始化导致字段名映射错乱、字符串内存损坏（double-free）等问题。
+
+### 解决方案
+
+#### 方案一：预初始化（推荐）
+
+在启动工作线程之前，于主线程中显式调用 `ormpp::init_reflection<T>()` 触发一次性的反射初始化：
+
+```cpp
+#include "utility.hpp"
+
+struct person {
+  int id;
+  std::string name;
+  int age;
+};
+YLT_REFL(person, id, name, age);
+
+int main() {
+  // 1. 单线程预初始化（主线程）
+  ormpp::init_reflection<person>();
+
+  // 2. 此后可安全地在多线程中并发查询
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([]() {
+      dbng<mysql> mysql;
+      mysql.connect("127.0.0.1", "root", "12345", "testdb");
+      auto result = mysql.query<person>();  // 线程安全
+    });
+  }
+  for (auto &t : threads) t.join();
+}
+```
+
+#### 方案二：自动保护（内部缓存）
+
+ormpp 内部对 SQL 字段列表缓存（`get_fields<T>()`）已使用 `std::call_once` 保护，确保多线程首次并发访问时只初始化一次。但**仍强烈建议在应用层做预初始化**，因为 iguana 层面的反射元数据初始化不在 ormpp 控制范围内。
+
+### 适用场景
+
+- ✅ 单线程顺序查询：无需额外处理
+- ⚠️ 多线程同时首次查询**同一类型**：需要预初始化
+- ✅ 多线程查询不同类型（每个类型首次查询单线程）：无需额外处理
+
 ## roadmap
 
 1. 支持组合键。
@@ -941,7 +1039,7 @@ TEST_REQUIRE(r);
 
 purecpp@163.com
 
-qq群: 492859173
+线上讨论: [项目讨论](https://purecpp.cn/chatroom.html)
 
 [http://purecpp.cn/](http://purecpp.cn/ "purecpp")
 

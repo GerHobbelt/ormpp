@@ -65,6 +65,16 @@ struct builder_person {
 };
 REGISTER_AUTO_KEY(builder_person, id)
 
+struct fake_postgresql_db {
+  static constexpr DBType db_type_v = DBType::postgresql;
+};
+
+struct ormpp_partition_log {
+  int id;
+  int bucket;
+  std::string payload;
+};
+
 TEST_CASE("test mysql long string") {
 #ifdef ORMPP_ENABLE_MYSQL
   dbng<mysql> mysql;
@@ -3073,6 +3083,127 @@ TEST_CASE("unsigned type") {
   }
 }
 
+TEST_CASE("builder range partition interfaces") {
+  auto p202405 = range_partition("p202405", 202405, 202406);
+  auto p202406 = range_partition("p202406", 202406, 202407);
+  auto p202407 = range_partition("p202407", 202407, 202408);
+
+#ifdef ORMPP_ENABLE_MYSQL
+  dbng<mysql> mysql;
+  if (mysql.connect(ip, username, password, db)) {
+    mysql.execute("drop table if exists ormpp_partition_log");
+    CHECK(mysql.create_table<ormpp_partition_log>()
+              .primary_key(col(&ormpp_partition_log::id),
+                           col(&ormpp_partition_log::bucket))
+              .partition_by_range(col(&ormpp_partition_log::bucket))
+              .partition(p202405)
+              .partition(p202406)
+              .execute());
+
+    CHECK(mysql.insert(ormpp_partition_log{1, 202405, "old"}) == 1);
+    CHECK(mysql.insert(ormpp_partition_log{2, 202406, "current"}) == 1);
+    CHECK(mysql.remove<ormpp_partition_log>()
+              .partition(col(&ormpp_partition_log::bucket), p202405)
+              .execute_all() == 1);
+    CHECK(mysql.query_s<ormpp_partition_log>("bucket=?", 202405).empty());
+
+    CHECK(mysql.alter_table<ormpp_partition_log>()
+              .clear_partition(col(&ormpp_partition_log::bucket), p202406)
+              .execute());
+    CHECK(mysql.query_s<ormpp_partition_log>().empty());
+
+    CHECK(mysql.alter_table<ormpp_partition_log>()
+              .add_partition(col(&ormpp_partition_log::bucket), p202407)
+              .drop_partition(p202407)
+              .execute());
+  }
+#endif
+
+#ifdef ORMPP_ENABLE_PG
+  dbng<postgresql> postgres;
+  if (postgres.connect(ip, username, password, db)) {
+    postgres.execute("drop table if exists ormpp_partition_log cascade");
+    CHECK(postgres.create_table<ormpp_partition_log>()
+              .primary_key(col(&ormpp_partition_log::id),
+                           col(&ormpp_partition_log::bucket))
+              .partition_by_range(col(&ormpp_partition_log::bucket))
+              .partition(p202405)
+              .partition(p202406)
+              .execute());
+
+    CHECK(postgres.insert(ormpp_partition_log{1, 202405, "old"}) == 1);
+    CHECK(postgres.insert(ormpp_partition_log{2, 202406, "current"}) == 1);
+    CHECK(postgres.remove<ormpp_partition_log>()
+              .partition(col(&ormpp_partition_log::bucket), p202405)
+              .execute_all() == 1);
+    CHECK(postgres.query_s<ormpp_partition_log>("bucket=$1", 202405).empty());
+
+    CHECK(postgres.alter_table<ormpp_partition_log>()
+              .clear_partition(col(&ormpp_partition_log::bucket), p202406)
+              .execute());
+    CHECK(postgres.query_s<ormpp_partition_log>().empty());
+
+    CHECK(postgres.alter_table<ormpp_partition_log>()
+              .add_partition(col(&ormpp_partition_log::bucket), p202407)
+              .drop_partition(p202407)
+              .execute());
+  }
+#endif
+
+  dbng<sqlite> sqlite;
+#ifdef SQLITE_HAS_CODEC
+  if (sqlite.connect(db, password)) {
+#else
+  if (sqlite.connect(db)) {
+#endif
+    sqlite.execute("drop table if exists ormpp_partition_log");
+    CHECK(sqlite.create_table<ormpp_partition_log>()
+              .primary_key(col(&ormpp_partition_log::id),
+                           col(&ormpp_partition_log::bucket))
+              .partition_by_range(col(&ormpp_partition_log::bucket))
+              .partition(p202405)
+              .partition(p202406)
+              .execute());
+
+    CHECK(sqlite.insert(ormpp_partition_log{1, 202405, "old"}) == 1);
+    CHECK(sqlite.insert(ormpp_partition_log{2, 202406, "current"}) == 1);
+    CHECK(sqlite.remove<ormpp_partition_log>()
+              .partition(col(&ormpp_partition_log::bucket), p202405)
+              .execute_all() == 1);
+    CHECK(sqlite.query_s<ormpp_partition_log>("bucket=?", 202405).empty());
+
+    CHECK(sqlite.alter_table<ormpp_partition_log>()
+              .clear_partition(col(&ormpp_partition_log::bucket), p202406)
+              .execute());
+    CHECK(sqlite.query_s<ormpp_partition_log>().empty());
+
+    CHECK(sqlite.alter_table<ormpp_partition_log>()
+              .add_partition(col(&ormpp_partition_log::bucket), p202407)
+              .execute());
+    CHECK_FALSE(sqlite.alter_table<ormpp_partition_log>()
+                    .drop_partition(p202407)
+                    .execute());
+    CHECK_FALSE(sqlite.create_table<ormpp_partition_log>()
+                    .partition_by_range(col(&ormpp_partition_log::bucket))
+                    .partition(range_partition("bad-name", 1, 2))
+                    .execute());
+  }
+}
+
+TEST_CASE("postgresql alter table add_index uses if not exists") {
+  alter_table_builder<builder_person, fake_postgresql_db *> builder{nullptr};
+  builder.add_index("idx_builder_person_name", col(&builder_person::name));
+
+  REQUIRE(builder.ops_.size() == 1);
+
+  std::string sql;
+  CHECK(
+      builder.build_operation_sql(builder.ops_.front(), "builder_person", sql));
+  CHECK(sql ==
+        "CREATE INDEX IF NOT EXISTS idx_builder_person_name ON "
+        "builder_person(name)");
+}
+
 #if __cplusplus >= 202002L
 
 struct region_model {
@@ -3879,4 +4010,114 @@ TEST_CASE("issue #253: pg select with string in") {
 
   postgres.execute("drop table if exists users;");
 #endif
+}
+
+// ------------------------------------------------------------------
+// Thread-safety test for issue #238
+// ------------------------------------------------------------------
+
+struct thread_test_person {
+  int id;
+  std::string name;
+  int age;
+};
+REGISTER_AUTO_KEY(thread_test_person, id)
+
+TEST_CASE("issue #238: multi-thread concurrent first query") {
+  // Use SQLite (no external DB needed) to test thread safety
+  dbng<sqlite> sqlite_db;
+  if (!sqlite_db.connect(":memory:")) {
+    // Skip if SQLite not available
+    return;
+  }
+
+  sqlite_db.execute("drop table if exists thread_test_person");
+  REQUIRE(sqlite_db.create_datatable<thread_test_person>(ormpp_auto_key{"id"}));
+
+  // Insert test data
+  for (int i = 1; i <= 10; ++i) {
+    thread_test_person p{0, "person_" + std::to_string(i), 20 + i};
+    REQUIRE(sqlite_db.insert(p) == 1);
+  }
+
+  // Verify data is there
+  auto all = sqlite_db.query<thread_test_person>();
+  REQUIRE(all.size() == 10);
+
+  // --- Test without init_reflection: concurrent first query ---
+  // Note: we use a fresh in-memory DB per thread to truly test
+  // the "first query" scenario for the same type T
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  std::atomic<int> fail_count{0};
+
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&success_count, &fail_count, t]() {
+      try {
+        dbng<sqlite> db;
+        if (!db.connect(":memory:")) {
+          fail_count++;
+          return;
+        }
+        db.execute("drop table if exists thread_test_person");
+        db.create_datatable<thread_test_person>(ormpp_auto_key{"id"});
+
+        for (int i = 1; i <= 5; ++i) {
+          thread_test_person p{
+              0, "t" + std::to_string(t) + "_p" + std::to_string(i), 20 + i};
+          db.insert(p);
+        }
+
+        // Concurrent first query on the same type from multiple threads
+        auto result = db.query<thread_test_person>();
+        if (result.size() == 5) {
+          success_count++;
+        }
+        else {
+          fail_count++;
+        }
+      } catch (...) {
+        fail_count++;
+      }
+    });
+  }
+
+  for (auto &th : threads) {
+    th.join();
+  }
+
+  CHECK(fail_count == 0);
+  CHECK(success_count == 8);
+
+  // --- Test with init_reflection: should also pass ---
+  ormpp::init_reflection<thread_test_person>();
+
+  std::vector<std::thread> threads2;
+  std::atomic<int> success_count2{0};
+
+  for (int t = 0; t < 8; ++t) {
+    threads2.emplace_back([&success_count2, t]() {
+      dbng<sqlite> db;
+      if (!db.connect(":memory:"))
+        return;
+      db.execute("drop table if exists thread_test_person");
+      db.create_datatable<thread_test_person>(ormpp_auto_key{"id"});
+
+      for (int i = 1; i <= 3; ++i) {
+        thread_test_person p{0, "preinit_" + std::to_string(i), 30 + i};
+        db.insert(p);
+      }
+
+      auto result = db.query<thread_test_person>();
+      if (result.size() == 3) {
+        success_count2++;
+      }
+    });
+  }
+
+  for (auto &th : threads2) {
+    th.join();
+  }
+
+  CHECK(success_count2 == 8);
 }
