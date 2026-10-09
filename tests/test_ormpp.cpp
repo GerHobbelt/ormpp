@@ -81,6 +81,27 @@ struct builder_person {
 };
 REGISTER_AUTO_KEY(builder_person, id)
 
+struct mysql_keyword_material_index {
+  int id;
+  std::string company;
+  std::string group;
+  int MaterialNumber;
+};
+REGISTER_AUTO_KEY(mysql_keyword_material_index, id)
+
+struct insert_default_field {
+  int id;
+  std::string datetime;
+  std::string company;
+};
+REGISTER_AUTO_KEY(insert_default_field, id)
+REGISTER_SKIP_INSERT_FIELD(insert_default_field, datetime)
+
+struct only_default_field {
+  int id;
+};
+REGISTER_AUTO_KEY(only_default_field, id)
+
 struct fake_postgresql_db {
   static constexpr DBType db_type_v = DBType::postgresql;
 };
@@ -1719,6 +1740,102 @@ TEST_CASE("create table") {
   REQUIRE(mysql.create_datatable<person>(auto_key, not_null));
   REQUIRE(mysql.create_datatable<person>(not_null, auto_key));
 #endif
+}
+
+TEST_CASE("create mysql table with keyword field") {
+  CHECK(quote_mysql_identifier("group") == "`group`");
+  CHECK(quote_mysql_identifier("a`b") == "`a``b`");
+  CHECK(quote_mysql_identifier("a``b") == "`a````b`");
+  CHECK(quote_mysql_identifier("`a``b`") == "`a``b`");
+  CHECK(quote_mysql_identifier("`a`b`") == "`a``b`");
+
+  auto insert_sql =
+      generate_insert_sql<mysql_keyword_material_index>(DBType::mysql, true);
+  CHECK(insert_sql.find("`group`") != std::string::npos);
+  auto select_sql =
+      generate_query_sql<mysql_keyword_material_index>(DBType::mysql);
+  CHECK(select_sql.find("`group`") != std::string::npos);
+  auto sqlite_select_sql =
+      generate_query_sql<mysql_keyword_material_index>(DBType::sqlite);
+  CHECK(sqlite_select_sql.find("`group`") == std::string::npos);
+  CHECK(generate_query_sql<mysql_keyword_material_index>(DBType::mysql)
+            .find("`group`") != std::string::npos);
+  auto update_sql =
+      generate_update_sql<mysql_keyword_material_index,
+                          &mysql_keyword_material_index::group>(DBType::mysql);
+  CHECK(update_sql.find("`group`=?") != std::string::npos);
+  CHECK(update_sql.find("`id`=?") != std::string::npos);
+
+#ifdef ORMPP_ENABLE_MYSQL
+  dbng<mysql> mysql;
+  if (mysql.connect(ip, username, password, db)) {
+    mysql.execute("drop table if exists mysql_keyword_material_index");
+    REQUIRE(mysql.create_datatable<mysql_keyword_material_index>(
+        ormpp_auto_key{"id"}));
+    REQUIRE(mysql.insert<mysql_keyword_material_index>(
+                {0, "purecpp", "first", 42}) == 1);
+    auto rows = mysql.query_s<mysql_keyword_material_index>("`group`='first'");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().MaterialNumber == 42);
+    rows.front().group = "second";
+    REQUIRE(mysql.update_some<&mysql_keyword_material_index::group>(
+                rows.front()) == 1);
+    auto updated =
+        mysql.query_s<mysql_keyword_material_index>("`group`='second'");
+    REQUIRE(updated.size() == 1);
+    CHECK(updated.front().company == "purecpp");
+  }
+#endif
+}
+
+TEST_CASE("skip insert field") {
+  auto mysql_sql =
+      generate_insert_sql<insert_default_field>(DBType::mysql, true);
+  CHECK(mysql_sql.find("`id`") == std::string::npos);
+  CHECK(mysql_sql.find("`datetime`") == std::string::npos);
+  CHECK(mysql_sql.find("`company`") != std::string::npos);
+  CHECK(mysql_sql.find("values(?)") != std::string::npos);
+
+  dbng<sqlite> sqlite;
+#ifdef SQLITE_HAS_CODEC
+  REQUIRE(sqlite.connect(db, password));
+#else
+  REQUIRE(sqlite.connect(db));
+#endif
+  sqlite.execute("drop table if exists insert_default_field");
+  REQUIRE(sqlite.execute(
+      "create table insert_default_field(id integer primary key autoincrement, "
+      "datetime text default 'db_default', company text)"));
+  REQUIRE(sqlite.insert<insert_default_field>({0, "ignored", "purecpp"}) == 1);
+
+  auto rows = sqlite.query_s<insert_default_field>("order by id");
+  REQUIRE(rows.size() == 1);
+  CHECK(rows[0].datetime == "db_default");
+  CHECK(rows[0].company == "purecpp");
+}
+
+TEST_CASE("insert with only database default fields") {
+  CHECK(generate_insert_sql<only_default_field>(DBType::mysql, true) ==
+        "insert into only_default_field () values() ");
+  CHECK(generate_insert_sql<only_default_field>(DBType::sqlite, true) ==
+        "insert into only_default_field default values ");
+  CHECK(generate_insert_sql<only_default_field>(DBType::postgresql, true) ==
+        "insert into only_default_field default values ");
+
+  dbng<sqlite> sqlite;
+#ifdef SQLITE_HAS_CODEC
+  REQUIRE(sqlite.connect(db, password));
+#else
+  REQUIRE(sqlite.connect(db));
+#endif
+  sqlite.execute("drop table if exists only_default_field");
+  REQUIRE(
+      sqlite.execute("create table only_default_field(id integer primary "
+                     "key autoincrement)"));
+  REQUIRE(sqlite.insert(only_default_field{0}) == 1);
+  auto rows = sqlite.query_s<only_default_field>();
+  REQUIRE(rows.size() == 1);
+  CHECK(rows.front().id > 0);
 }
 
 TEST_CASE("insert query") {

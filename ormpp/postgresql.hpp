@@ -549,12 +549,12 @@ class postgresql {
   }
 
   template <typename T>
-  bool prepare(const std::string &sql) {
+  bool prepare(const std::string &sql,
+               int parameter_count = ylt::reflection::members_count_v<T>) {
 #ifdef ORMPP_ENABLE_LOG
     std::cout << sql << std::endl;
 #endif
-    res_ = PQprepare(con_, "", sql.data(), ylt::reflection::members_count_v<T>,
-                     nullptr);
+    res_ = PQprepare(con_, "", sql.data(), parameter_count, nullptr);
     auto guard = guard_statment(res_);
     return PQresultStatus(res_) == PGRES_COMMAND_OK;
   }
@@ -573,7 +573,8 @@ class postgresql {
     else {
       ylt::reflection::for_each(t, [arr, &param_values, type, this](
                                        auto &field, auto name, auto index) {
-        if (type == OptType::insert && is_auto_key<T>(name)) {
+        if (type == OptType::insert &&
+            (is_auto_key<T>(name) || is_skip_insert_field<T>(name))) {
           return;
         }
         if constexpr (sizeof...(members) > 0) {
@@ -598,10 +599,6 @@ class postgresql {
               }
             });
       }
-    }
-
-    if (param_values.empty()) {
-      return std::nullopt;
     }
 
     auto param_values_buf = make_param_value_buffers(param_values);
@@ -674,9 +671,13 @@ class postgresql {
                                                 OptType type,
                                                 bool get_insert_id = false,
                                                 Args &&...args) {
-    if (!prepare<T>(get_insert_id
-                        ? sql + "returning " + get_auto_key<T>().data()
-                        : sql)) {
+    const int parameter_count =
+        type == OptType::insert && sql.ends_with("default values ")
+            ? 0
+            : ylt::reflection::members_count_v<T>;
+    if (!prepare<T>(
+            get_insert_id ? sql + "returning " + get_auto_key<T>().data() : sql,
+            parameter_count)) {
       return std::nullopt;
     }
 
@@ -693,9 +694,13 @@ class postgresql {
       return std::nullopt;
     }
 
-    if (!prepare<T>(get_insert_id
-                        ? sql + "returning " + get_auto_key<T>().data()
-                        : sql)) {
+    const int parameter_count =
+        type == OptType::insert && sql.ends_with("default values ")
+            ? 0
+            : ylt::reflection::members_count_v<T>;
+    if (!prepare<T>(
+            get_insert_id ? sql + "returning " + get_auto_key<T>().data() : sql,
+            parameter_count)) {
       return std::nullopt;
     }
 
